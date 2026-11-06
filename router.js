@@ -1149,6 +1149,10 @@ function extractTextToolCalls(content, allowedNames = AVAILABLE_TOOLS.map(tool =
   return calls.length ? calls : null;
 }
 
+function hasTextToolCallSyntax(content) {
+  return /<tool_call>|```[\t ]*json\b|(?:^|\n)\s*json(?:\s|\n|$)|\{\s*["'](?:name|function)["']\s*:/i.test(content);
+}
+
 function validateNativeToolCalls(calls) {
   if (!Array.isArray(calls) || !calls.length) return null;
   const valid = [];
@@ -2241,9 +2245,10 @@ async function handleStreamingChat(res, body, routedModel, searched, searchError
     const contentParts = [];
     const pendingEvents = [];
     let mode = null;
+    let holdTextToolCandidate = false;
     let lastChunk = null;
 
-    await readSseResponse(upstream, async (chunk, rawData) => {
+    const processStreamEvent = async (chunk, rawData) => {
       lastChunk = chunk;
       const delta = chunk?.choices?.[0]?.delta || {};
       if (Array.isArray(delta.tool_calls) && delta.tool_calls.length) {
@@ -2260,26 +2265,58 @@ async function handleStreamingChat(res, body, routedModel, searched, searchError
       }
 
       if (typeof delta.content === 'string') contentParts.push(delta.content);
+      if (activeTools && typeof delta.content === 'string'
+          && hasTextToolCallSyntax(contentParts.join(''))) {
+        holdTextToolCandidate = true;
+      }
       const hasText = (typeof delta.content === 'string' && delta.content.length > 0)
         || typeof delta.reasoning_content === 'string';
       if (mode === null && hasText) {
-        const probe = contentParts.join('').trimStart();
-        const mayBeTextToolCall = probe.length < 512
-          || probe.startsWith('{') || probe.startsWith('<') || probe.includes('```');
-        if (!mayBeTextToolCall || typeof delta.reasoning_content === 'string') {
+        if (!holdTextToolCandidate || typeof delta.reasoning_content === 'string') {
           mode = 'text';
-          startResponse();
-          for (const event of pendingEvents) res.write(`data: ${event}\n\n`);
-          pendingEvents.length = 0;
         }
       }
       if (mode === 'text') {
         startResponse();
-        res.write(`data: ${rawData}\n\n`);
+        if (holdTextToolCandidate) {
+          pendingEvents.push(rawData);
+        } else {
+          for (const event of pendingEvents) res.write(`data: ${event}\n\n`);
+          pendingEvents.length = 0;
+          res.write(`data: ${rawData}\n\n`);
+        }
       } else if (mode === null) {
         pendingEvents.push(rawData);
       }
-    });
+    };
+
+    if (/^text\/event-stream(?:\s*;|$)/i.test(upstream.headers.get('content-type') || '')) {
+      await readSseResponse(upstream, processStreamEvent);
+    } else {
+      let payload;
+      try {
+        payload = await upstream.json();
+      } catch (error) {
+        return json(res, 502, {
+          error: { message: `The ${routedModel} model server returned a non-SSE response that was not valid JSON: ${error.message}` },
+        });
+      }
+      if (!Array.isArray(payload?.choices) || payload.choices.length === 0) {
+        return json(res, 502, {
+          error: { message: `The ${routedModel} model server returned a non-SSE response without completion choices.` },
+        });
+      }
+      const chunk = {
+        ...payload,
+        object: 'chat.completion.chunk',
+        choices: payload.choices.map(choice => ({
+          ...choice,
+          delta: choice.delta || choice.message || {},
+          message: undefined,
+        })),
+      };
+      await processStreamEvent(chunk, JSON.stringify(chunk));
+    }
 
     if (!calls.length) {
       const textCalls = extractTextToolCalls(contentParts.join(''));
@@ -2351,6 +2388,8 @@ async function handleStreamingChat(res, body, routedModel, searched, searchError
       })}\n\n`);
     } else if (mode === null) {
       startResponse();
+      for (const event of pendingEvents) res.write(`data: ${event}\n\n`);
+    } else if (pendingEvents.length) {
       for (const event of pendingEvents) res.write(`data: ${event}\n\n`);
     }
     break;

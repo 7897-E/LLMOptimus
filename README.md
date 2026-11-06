@@ -21,10 +21,39 @@ refactoring, and test-writing tasks to Coder. It sends conversation, explanation
 reasoning, and factual research to General. You can still force `general` or
 `coder` with the request's `model` field or the web app selector.
 
-Streaming requests (`"stream": true`) are forwarded as live SSE tokens through
-the router. Tool-call turns are executed internally, then the resulting answer
-continues streaming to the client. Short activity lines such as `Reading file…`,
-`Editing file…`, and `Running command…` are streamed while tools execute.
+Streaming requests (`"stream": true`) use Server-Sent Events (SSE). Upstream SSE
+tokens are forwarded as they arrive, including short replies. If a model server
+returns a regular JSON completion instead, the router converts it to a valid
+single-event SSE response; that fallback cannot provide token-level streaming
+because the upstream response was not streamed. Text-form tool calls remain
+buffered until validated so their raw call payload is not shown to the client.
+Tool-call turns are executed internally, then the resulting answer continues
+streaming. Short activity lines such as `Reading file…`, `Editing file…`, and
+`Running command…` are streamed while tools execute.
+
+## VS Code and OpenAI-compatible clients
+
+Configure an OpenAI-compatible **Chat Completions** provider with:
+
+- Base URL: `http://127.0.0.1:8082/v1`
+- Model: `auto`, `general`, or `coder`
+- Streaming: enabled
+- API key: not required by the router; use a placeholder only if the extension
+  requires a non-empty value
+
+Some extensions ask for the full endpoint rather than a base URL; use
+`http://127.0.0.1:8082/v1/chat/completions` in that case, and avoid appending
+`/chat/completions` twice. `GET /v1/models` lists the three model IDs. The router
+implements chat completions, not the legacy `/v1/completions` or newer
+`/v1/responses` APIs, so choose an extension/provider that supports OpenAI-style
+Chat Completions.
+
+| Status | Feature |
+|---|---|
+| Improved | General and Coder chat streaming, including short replies and upstream JSON fallback |
+| Preserved | Automatic model routing, web search, tool execution/approvals, and llama-ui integration |
+| Supported | OpenAI-compatible Chat Completions and model discovery for compatible VS Code extensions |
+| Not supported | Legacy text completions and the `/v1/responses` API |
 
 Web search runs automatically for explicit searches and time-sensitive prompts
 such as news, weather, prices, schedules, current versions, or current office

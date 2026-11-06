@@ -31,7 +31,49 @@ async function main() {
   let requests = 0;
   let repairRequests = 0;
   let approvalPhase = false;
+  let generalStreamFinished = false;
+  let coderStreamFinished = false;
   let approvalTool = { name: 'read_file', arguments: { filepath: 'README.md' } };
+  const generalServer = http.createServer(async (req, res) => {
+    if (req.url === '/health') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end('{"status":"ok"}');
+    }
+
+    if (req.url === '/v1/chat/completions') {
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      const body = JSON.parse(Buffer.concat(chunks));
+      assert.equal(body.model, 'general');
+      assert.equal(body.stream, true);
+      const userPrompt = body.messages?.at(-1)?.content;
+      if (userPrompt === 'Explain why General responses should stream live') {
+        generalStreamFinished = false;
+        res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+        res.write(`data: ${JSON.stringify({ id: 'general-live', choices: [{ index: 0, delta: { content: 'Quick' }, finish_reason: null }] })}\n\n`);
+        setTimeout(() => {
+          generalStreamFinished = true;
+          res.end(`data: ${JSON.stringify({ id: 'general-live', choices: [{ index: 0, delta: { content: ' response.' }, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`);
+        }, 250);
+        return;
+      }
+      if (userPrompt === 'JSON upstream stream') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({
+          id: 'general-json',
+          object: 'chat.completion',
+          model: 'general',
+          choices: [{ index: 0, message: { role: 'assistant', content: 'General JSON response delivered as SSE.' }, finish_reason: 'stop' }],
+        }));
+      }
+      if (userPrompt === 'Malformed general JSON') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end('{"choices":');
+      }
+    }
+
+    res.writeHead(404).end();
+  });
   const modelServer = http.createServer(async (req, res) => {
     if (req.url === '/health') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -61,6 +103,18 @@ async function main() {
       const chunks = [];
       for await (const chunk of req) chunks.push(chunk);
       const body = JSON.parse(Buffer.concat(chunks));
+      const userPrompt = body.messages?.at(-1)?.content;
+      if (body.model === 'coder' && userPrompt === 'Fenced code streaming') {
+        assert.equal(body.stream, true);
+        coderStreamFinished = false;
+        res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+        res.write(`data: ${JSON.stringify({ id: 'coder-live', choices: [{ index: 0, delta: { content: '```python\nprint(' }, finish_reason: null }] })}\n\n`);
+        setTimeout(() => {
+          coderStreamFinished = true;
+          res.end(`data: ${JSON.stringify({ id: 'coder-live', choices: [{ index: 0, delta: { content: '"ok")\n```' }, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`);
+        }, 250);
+        return;
+      }
       if (body.messages?.[0]?.content?.startsWith('You are a tool-call repair engine.')) {
         assert.match(body.messages?.[1]?.content || '', /CORRECTED_TOOL_CALL=/);
         assert.equal(body.tool_choice, 'required');
@@ -217,8 +271,13 @@ async function main() {
       if (requests <= 2) {
         res.write('data: {"id":"chatcmpl-test","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}\n\n');
         const directory = requests === 1 ? '' : '.';
-        res.write(`data: ${JSON.stringify({ id: 'chatcmpl-test', choices: [{ index: 0, delta: { content: `I will inspect it.\n\n\`\`\`json\n${JSON.stringify({ name: 'get_project_structure', arguments: { directory, maxDepth: 3, exclude: [] } })}\n\`\`\`` }, finish_reason: 'stop' }] })}\n\n`);
-        res.end('data: [DONE]\n\n');
+        const toolCallText = `\`\`\`json\n${JSON.stringify({ name: 'get_project_structure', arguments: { directory, maxDepth: 3, exclude: [] } })}\n\`\`\``;
+        if (requests === 1) {
+          res.write(`data: ${JSON.stringify({ id: 'chatcmpl-test', choices: [{ index: 0, delta: { content: 'I will inspect it.\n\n' }, finish_reason: null }] })}\n\n`);
+          setTimeout(() => res.end(`data: ${JSON.stringify({ id: 'chatcmpl-test', choices: [{ index: 0, delta: { content: toolCallText }, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`), 25);
+        } else {
+          res.end(`data: ${JSON.stringify({ id: 'chatcmpl-test', choices: [{ index: 0, delta: { content: `I will inspect it.\n\n${toolCallText}` }, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`);
+        }
       } else {
         res.write('data: {"id":"chatcmpl-test","choices":[{"index":0,"delta":{"role":"assistant","content":"Tool "},"finish_reason":null}]}\n\n');
         setTimeout(() => res.end('data: {"id":"chatcmpl-test","choices":[{"index":0,"delta":{"content":"worked."},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'), 100);
@@ -229,6 +288,7 @@ async function main() {
     res.writeHead(404).end();
   });
 
+  await listen(generalServer, 18080);
   await listen(modelServer, 18081);
   const router = spawn(process.execPath, ['router.js'], {
     cwd: __dirname,
@@ -251,6 +311,9 @@ async function main() {
     assert.equal(tools.data.length, 11);
     assert.equal(tools.data[0].name, 'web_search');
     assert.equal(tools.data[0].type, 'function');
+
+    const models = await fetch('http://127.0.0.1:18082/v1/models').then(response => response.json());
+    assert.deepEqual(models.data.map(model => model.id), ['auto', 'general', 'coder']);
 
     const propsResponse = await fetch('http://127.0.0.1:18082/props');
     const props = await propsResponse.json();
@@ -764,8 +827,68 @@ async function main() {
     assert.ok(streamedText.includes('✓ get_project_structure'));
     assert.ok(streamedText.includes('Project structure'));
     assert.ok(streamedText.includes('router.js'));
+    assert.ok(!streamedText.includes('"name":"get_project_structure"'));
     assert.ok(stream.includes('data: [DONE]'));
     assert.equal(requests, 2);
+
+    const generalLiveResponse = await fetch('http://127.0.0.1:18082/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'auto', stream: true, messages: [{ role: 'user', content: 'Explain why General responses should stream live' }] }),
+    });
+    assert.equal(generalLiveResponse.headers.get('x-llm-routed-model'), 'general');
+    const generalReader = generalLiveResponse.body.getReader();
+    const firstGeneralChunk = await generalReader.read();
+    assert.equal(generalStreamFinished, false, 'General SSE text should reach the client before upstream completion');
+    let generalStreamText = new TextDecoder().decode(firstGeneralChunk.value);
+    while (true) {
+      const { done, value } = await generalReader.read();
+      if (done) break;
+      generalStreamText += new TextDecoder().decode(value);
+    }
+    assert.match(generalStreamText, /Quick/);
+    assert.match(generalStreamText, /response\./);
+    assert.ok(generalStreamText.includes('data: [DONE]'));
+
+    const coderLiveResponse = await fetch('http://127.0.0.1:18082/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'coder', stream: true, messages: [{ role: 'user', content: 'Fenced code streaming' }] }),
+    });
+    const coderReader = coderLiveResponse.body.getReader();
+    const firstCoderChunk = await coderReader.read();
+    assert.equal(coderStreamFinished, false, 'Fenced code should stream before upstream completion');
+    let coderStreamText = new TextDecoder().decode(firstCoderChunk.value);
+    while (true) {
+      const { done, value } = await coderReader.read();
+      if (done) break;
+      coderStreamText += new TextDecoder().decode(value);
+    }
+    const coderStreamContent = coderStreamText.split(/\r?\n/)
+      .filter(line => line.startsWith('data: ') && line !== 'data: [DONE]')
+      .map(line => JSON.parse(line.slice(6)).choices?.[0]?.delta?.content || '')
+      .join('');
+    assert.match(coderStreamContent, /```python\nprint\("ok"\)\n```/);
+    assert.ok(coderStreamText.includes('data: [DONE]'));
+
+    const generalJsonResponse = await fetch('http://127.0.0.1:18082/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'general', stream: true, messages: [{ role: 'user', content: 'JSON upstream stream' }] }),
+    });
+    const generalJsonStream = await generalJsonResponse.text();
+    assert.match(generalJsonResponse.headers.get('content-type'), /^text\/event-stream/);
+    assert.ok(generalJsonStream.includes('General JSON response delivered as SSE.'));
+    assert.ok(generalJsonStream.includes('data: [DONE]'));
+
+    const malformedGeneralResponse = await fetch('http://127.0.0.1:18082/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'general', stream: true, messages: [{ role: 'user', content: 'Malformed general JSON' }] }),
+    });
+    const malformedGeneralPayload = await malformedGeneralResponse.json();
+    assert.equal(malformedGeneralResponse.status, 502);
+    assert.match(malformedGeneralPayload.error.message, /not valid JSON/);
 
     approvalPhase = true;
     await fetch('http://127.0.0.1:18082/v1/settings', {
@@ -814,6 +937,7 @@ async function main() {
     assert.ok(trashed);
   } finally {
     router.kill();
+    await close(generalServer);
     await close(modelServer);
     fs.rmSync('.router-delete-test.txt', { force: true });
     fs.rmSync('.router-approval-test.txt', { force: true });
