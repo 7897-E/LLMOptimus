@@ -34,6 +34,9 @@ async function main() {
   let generalStreamFinished = false;
   let coderStreamFinished = false;
   let nativeStreamFinished = false;
+  let nativeReasoningFinished = false;
+  let nativeToolTextFinished = false;
+  let toolTextFinished = false;
   let approvalTool = { name: 'read_file', arguments: { filepath: 'README.md' } };
   const generalServer = http.createServer(async (req, res) => {
     if (req.url === '/health') {
@@ -116,6 +119,31 @@ async function main() {
       for await (const chunk of req) chunks.push(chunk);
       const body = JSON.parse(Buffer.concat(chunks));
       const userPrompt = body.messages?.at(-1)?.content;
+      if (userPrompt === 'Native live reasoning') {
+        nativeReasoningFinished = false;
+        res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+        res.write(`data: ${JSON.stringify({ id: 'native-reasoning', choices: [{ index: 0, delta: { reasoning_content: 'Actual thought, streaming.' }, finish_reason: null }] })}\n\n`);
+        setTimeout(() => {
+          nativeReasoningFinished = true;
+          res.end(`data: ${JSON.stringify({ id: 'native-reasoning', choices: [{ index: 0, delta: { content: 'Final answer.' }, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`);
+        }, 250);
+        return;
+      }
+      if (userPrompt === 'Native streaming tool text') {
+        nativeToolTextFinished = false;
+        res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+        res.write(`data: ${JSON.stringify({ id: 'native-tool-live', choices: [{ index: 0, delta: { content: 'json\\n\\n{"name":"file_glob_search","arguments":{"path":' }, finish_reason: null }] })}\n\n`);
+        setTimeout(() => {
+          if (res.destroyed) return;
+          res.write(`data: ${JSON.stringify({ id: 'native-tool-live', choices: [{ index: 0, delta: { content: '".","include":"**"}}' }, finish_reason: null }] })}\n\n`);
+          setTimeout(() => {
+            if (res.destroyed) return;
+            nativeToolTextFinished = true;
+            res.end(`data: ${JSON.stringify({ id: 'native-tool-live', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`);
+          }, 500);
+        }, 50);
+        return;
+      }
       if (userPrompt === 'Native live plain text') {
         nativeStreamFinished = false;
         res.writeHead(200, { 'Content-Type': 'text/event-stream' });
@@ -306,8 +334,12 @@ async function main() {
         const directory = requests === 1 ? '' : '.';
         const toolCallText = `\`\`\`json\n${JSON.stringify({ name: 'get_project_structure', arguments: { directory, maxDepth: 3, exclude: [] } })}\n\`\`\``;
         if (requests === 1) {
+          toolTextFinished = false;
           res.write(`data: ${JSON.stringify({ id: 'chatcmpl-test', choices: [{ index: 0, delta: { content: 'I will inspect it.\n\n' }, finish_reason: null }] })}\n\n`);
-          setTimeout(() => res.end(`data: ${JSON.stringify({ id: 'chatcmpl-test', choices: [{ index: 0, delta: { content: toolCallText }, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`), 25);
+          setTimeout(() => {
+            toolTextFinished = true;
+            res.end(`data: ${JSON.stringify({ id: 'chatcmpl-test', choices: [{ index: 0, delta: { content: toolCallText }, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`);
+          }, 250);
         } else {
           res.end(`data: ${JSON.stringify({ id: 'chatcmpl-test', choices: [{ index: 0, delta: { content: `I will inspect it.\n\n${toolCallText}` }, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`);
         }
@@ -366,6 +398,8 @@ async function main() {
     const uiScript = await uiScriptResponse.text();
     assert.match(uiScript, /General model routing preference/);
     assert.match(uiScript, /llm-optimus-tool-call/);
+    assert.match(uiScript, /aria-haspopup/);
+    assert.match(uiScript, /background:#fff/);
 
     const nativeToolsResponse = await fetch('http://127.0.0.1:18082/tools');
     const nativeTools = await nativeToolsResponse.json();
@@ -472,7 +506,7 @@ async function main() {
         tools: nativeTools.map(tool => tool.definition),
       }),
     }).then(response => response.text());
-    assert.ok(distinctProgress.includes('Reviewing the latest tool result'));
+    assert.ok(!distinctProgress.includes('Reviewing the latest tool result'));
     assert.ok(distinctProgress.includes('tool_calls'));
 
     const freshTurnAfterOldTools = await fetch('http://127.0.0.1:18082/v1/chat/completions', {
@@ -861,7 +895,19 @@ async function main() {
         messages: [{ role: 'user', content: 'Tell me my current project file structure.' }],
       }),
     });
-    const stream = await chatResponse.text();
+    const chatReader = chatResponse.body.getReader();
+    let stream = '';
+    while (!stream.includes('I will inspect it.')) {
+      const { done, value } = await chatReader.read();
+      assert.equal(done, false, 'tool-call preamble should stream before the upstream finishes');
+      stream += new TextDecoder().decode(value);
+    }
+    assert.equal(toolTextFinished, false, 'text-form tool output should be forwarded while still being analyzed');
+    while (true) {
+      const { done, value } = await chatReader.read();
+      if (done) break;
+      stream += new TextDecoder().decode(value);
+    }
     assert.match(chatResponse.headers.get('content-type'), /^text\/event-stream/);
     const streamedText = stream.split(/\r?\n/)
       .filter(line => line.startsWith('data: ') && line !== 'data: [DONE]')
@@ -892,6 +938,61 @@ async function main() {
     assert.ok(nativeStreamText.includes('This answer'));
     assert.ok(nativeStreamText.includes('is streaming.'));
     assert.ok(nativeStreamText.includes('data: [DONE]'));
+
+    const nativeReasoningResponse = await fetch('http://127.0.0.1:18082/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'coder', stream: true,
+        messages: [{ role: 'user', content: 'Native live reasoning' }],
+        tools: nativeTools.map(tool => tool.definition),
+      }),
+    });
+    const nativeReasoningReader = nativeReasoningResponse.body.getReader();
+    const firstReasoningChunk = await nativeReasoningReader.read();
+    const firstReasoningEvent = new TextDecoder().decode(firstReasoningChunk.value);
+    assert.equal(nativeReasoningFinished, false, 'actual model reasoning should stream before the upstream finishes');
+    assert.ok(firstReasoningEvent.includes('Actual thought, streaming.'));
+    let nativeReasoningStream = firstReasoningEvent;
+    while (true) {
+      const { done, value } = await nativeReasoningReader.read();
+      if (done) break;
+      nativeReasoningStream += new TextDecoder().decode(value);
+    }
+    assert.ok(nativeReasoningStream.includes('Final answer.'));
+    assert.ok(!nativeReasoningStream.includes('Processing the prompt and planning the first step'));
+
+    const nativeToolLiveResponse = await fetch('http://127.0.0.1:18082/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'coder', stream: true,
+        messages: [{ role: 'user', content: 'Native streaming tool text' }],
+        tools: nativeTools.map(tool => tool.definition),
+      }),
+    });
+    const nativeToolReader = nativeToolLiveResponse.body.getReader();
+    const firstNativeToolChunk = await nativeToolReader.read();
+    assert.equal(nativeToolTextFinished, false, 'native tool text should stream before its JSON arguments finish');
+    const firstNativeToolText = new TextDecoder().decode(firstNativeToolChunk.value);
+    const firstNativeToolEvent = JSON.parse(firstNativeToolText.match(/^data: (.+)$/m)[1]);
+    assert.ok(firstNativeToolEvent.choices[0].delta.content.includes('"name":"file_glob_search"'));
+    let nativeToolStreamText = '';
+    while (true) {
+      const { done, value } = await nativeToolReader.read();
+      if (done) break;
+      nativeToolStreamText += new TextDecoder().decode(value);
+    }
+    assert.equal(nativeToolTextFinished, false, 'the router should recognize a complete tool call without waiting for upstream completion');
+    const nativeToolCall = nativeToolStreamText.split(/\r?\n/)
+      .filter(line => line.startsWith('data: ') && line !== 'data: [DONE]')
+      .map(line => JSON.parse(line.slice(6)).choices?.[0]?.delta?.tool_calls || [])
+      .flat()
+      .find(call => call.function?.name === 'file_glob_search');
+    assert.ok(nativeToolCall);
+    assert.deepEqual(JSON.parse(nativeToolCall.function.arguments), { path: '.', include: '**' });
+    assert.ok(nativeToolStreamText.includes('"finish_reason":"tool_calls"'));
+    assert.ok(!nativeToolStreamText.includes('Processing the prompt and planning the first step'));
 
     const highBiasResponse = await fetch('http://127.0.0.1:18082/v1/chat/completions', {
       method: 'POST',

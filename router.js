@@ -1075,11 +1075,23 @@ function extractToolCalls(response) {
   return message.tool_calls;
 }
 
-function extractTextToolCalls(content, allowedNames = AVAILABLE_TOOLS.map(tool => tool.function.name)) {
-  if (typeof content !== 'string' || !content.trim()) return null;
-  const tagged = [...content.matchAll(/<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/gi)].map(match => match[1]);
-  const fenced = [...content.matchAll(/```(?:json)?\s*([\s\S]*?)\s*```/gi)].map(match => match[1]);
-  const trimmed = content.trim().replace(/^json\s*/i, '');
+function extractTextToolCalls(content, allowedNames = AVAILABLE_TOOLS.map(tool => tool.function.name), includeOffset = false) {
+  if (typeof content !== 'string' || !content.trim()) return includeOffset ? { calls: null, start: -1 } : null;
+  const tagged = [...content.matchAll(/<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/gi)].map(match => ({
+    text: match[1],
+    start: match.index + match[0].indexOf(match[1]),
+  }));
+  const fenced = [...content.matchAll(/```(?:json)?\s*([\s\S]*?)\s*```/gi)].map(match => ({
+    text: match[1],
+    start: match.index + match[0].indexOf(match[1]),
+  }));
+  let trimmed = content.trim();
+  let trimmedStart = content.indexOf(trimmed);
+  const jsonPrefix = trimmed.match(/^json\s*/i);
+  if (jsonPrefix) {
+    trimmed = trimmed.slice(jsonPrefix[0].length);
+    trimmedStart += jsonPrefix[0].length;
+  }
   // Pull complete JSON objects out of mixed model output. Small models may
   // append a fabricated <tool_response> after a valid call; a greedy
   // first-{...last-} slice makes the otherwise valid call unparsable.
@@ -1103,25 +1115,26 @@ function extractTextToolCalls(content, allowedNames = AVAILABLE_TOOLS.map(tool =
     } else if (char === '}' && depth > 0) {
       depth--;
       if (depth === 0 && start >= 0) {
-        embedded.push(trimmed.slice(start, index + 1));
+        embedded.push({ text: trimmed.slice(start, index + 1), start: trimmedStart + start });
         start = -1;
       }
     }
   }
-  const candidates = tagged.length ? tagged : fenced.length ? fenced : embedded.length ? embedded : [trimmed];
+  const candidates = tagged.length ? tagged : fenced.length ? fenced : embedded.length ? embedded : [{ text: trimmed, start: trimmedStart }];
   const allowed = new Set(allowedNames);
   const calls = [];
+  let firstCallStart = -1;
 
   for (const candidate of candidates) {
     try {
       let parsed;
       try {
-        parsed = JSON.parse(candidate);
+        parsed = JSON.parse(candidate.text);
       } catch {
         // Small local models sometimes use Python-style triple-quoted strings
         // for multiline file contents. That is readable, but it is not JSON,
         // so normalize those values before parsing the tool call.
-        const repairedMultilineStrings = candidate.replace(
+        const repairedMultilineStrings = candidate.text.replace(
           /"""\r?\n?([\s\S]*?)\r?\n?"""/g,
           (_, value) => JSON.stringify(value)
         );
@@ -1134,7 +1147,9 @@ function extractTextToolCalls(content, allowedNames = AVAILABLE_TOOLS.map(tool =
       const items = Array.isArray(parsed) ? parsed : [parsed];
       for (const item of items) {
         const fn = item?.function || item;
-        if (typeof fn?.name !== 'string' || fn.name.length === 0 || fn.arguments == null) continue;
+        if (typeof fn?.name !== 'string' || fn.name.length === 0) continue;
+        if (includeOffset && firstCallStart < 0) firstCallStart = candidate.start;
+        if (fn.arguments == null) continue;
         if (!allowed.has(fn.name)) continue;
         calls.push({
           id: item.id || `call_${Date.now()}_${calls.length}`,
@@ -1147,11 +1162,8 @@ function extractTextToolCalls(content, allowedNames = AVAILABLE_TOOLS.map(tool =
       }
     } catch { /* Try the next complete JSON object. */ }
   }
+  if (includeOffset) return { calls: calls.length ? calls : null, start: firstCallStart };
   return calls.length ? calls : null;
-}
-
-function hasTextToolCallSyntax(content) {
-  return /<tool_call>|```[\t ]*json\b|(?:^|\n)\s*json(?:\s|\n|$)|\{\s*["'](?:name|function)["']\s*:/i.test(content);
 }
 
 function validateNativeToolCalls(calls) {
@@ -2058,53 +2070,17 @@ async function proxyNativeToolChat(res, body, routedModel) {
     res.writeHead(200, headers);
     res.flushHeaders?.();
   };
-  const pending = [];
   const contentParts = [];
   const structuredCalls = [];
   let mode = null;
+  let earlyCalls = null;
   let lastChunk = null;
 
   start();
-  res.write(`data: ${JSON.stringify({
-    id: `chatcmpl-activity-${Date.now()}`,
-    object: 'chat.completion.chunk',
-    created: Math.floor(Date.now() / 1000),
-    model: routedModel,
-    choices: [{ index: 0, delta: { role: 'assistant', reasoning_content: toolMessages.length
-      ? 'Reviewing the latest tool result and deciding the next step...'
-      : 'Processing the prompt and planning the first step...' }, finish_reason: null }],
-  })}\n\n`);
-
-  await readSseResponse(upstream, async (chunk, rawData) => {
+  await readSseResponse(upstream, async chunk => {
     lastChunk = chunk;
     const delta = chunk?.choices?.[0]?.delta || {};
-    let bufferedData = rawData;
-    if (typeof delta.reasoning_content === 'string' && delta.reasoning_content.length) {
-      // Reasoning is never a textual tool call. Forward it immediately while
-      // continuing to buffer visible content long enough to recognize tools.
-      const reasoningChunk = {
-        ...chunk,
-        choices: chunk.choices.map(choice => ({
-          ...choice,
-          delta: {
-            ...(choice.delta?.role ? { role: choice.delta.role } : {}),
-            reasoning_content: choice.delta?.reasoning_content || '',
-          },
-          finish_reason: null,
-        })),
-      };
-      start();
-      res.write(`data: ${JSON.stringify(reasoningChunk)}\n\n`);
-      if (typeof delta.content !== 'string' && !delta.tool_calls && !chunk?.choices?.[0]?.finish_reason) return;
-      const residualChunk = {
-        ...chunk,
-        choices: chunk.choices.map(choice => ({
-          ...choice,
-          delta: Object.fromEntries(Object.entries(choice.delta || {}).filter(([key]) => key !== 'reasoning_content')),
-        })),
-      };
-      bufferedData = JSON.stringify(residualChunk);
-    }
+    const priorContentLength = contentParts.join('').length;
     if (Array.isArray(delta.tool_calls) && delta.tool_calls.length) {
       mode = 'structured';
       for (const fragment of delta.tool_calls) {
@@ -2118,23 +2094,27 @@ async function proxyNativeToolChat(res, body, routedModel) {
     }
     if (typeof delta.content === 'string') contentParts.push(delta.content);
 
-    if (mode === null) {
-      if (!hasTextToolCallSyntax(contentParts.join(''))) mode = 'text';
-    }
-    if (mode === 'text') {
-      start();
-      for (const event of pending.splice(0)) res.write(`data: ${event}\n\n`);
-      res.write(`data: ${bufferedData}\n\n`);
-    } else if (mode === 'structured') {
-      // Buffer complete structured calls so the router can validate, classify,
-      // and add trusted approval metadata before llama-ui displays them.
+    let toolCallStart = -1;
+    if (mode === 'structured') {
+      if (!forceFinal) earlyCalls = validateNativeToolCalls(structuredCalls)?.slice(0, 1) || null;
     } else {
-      pending.push(bufferedData);
+      const parsedText = extractTextToolCalls(contentParts.join(''), nativeNames, true);
+      toolCallStart = parsedText.start;
+      if (!forceFinal) earlyCalls = parsedText.calls;
     }
+    if (earlyCalls?.length) {
+      writeVisibleStreamChunk(res, start, hideParsedToolCallText(chunk, priorContentLength, toolCallStart));
+      return true;
+    }
+    if (mode !== 'structured' && toolCallStart >= 0) {
+      writeVisibleStreamChunk(res, start, hideParsedToolCallText(chunk, priorContentLength, toolCallStart));
+      return true;
+    }
+    writeVisibleStreamChunk(res, start, chunk);
   });
 
   const generatedContent = contentParts.join('');
-  let calls = forceFinal ? null : validateNativeToolCalls(
+  let calls = forceFinal ? null : earlyCalls || validateNativeToolCalls(
     mode === 'structured' ? structuredCalls : extractTextToolCalls(generatedContent, nativeNames)
   );
   if (!calls && !forceFinal && mode !== 'structured') calls = await repairNativeToolCall(generatedContent);
@@ -2181,8 +2161,9 @@ async function proxyNativeToolChat(res, body, routedModel) {
       model: routedModel,
       choices: [{ index: 0, delta: { role: 'assistant', content: rejectedToolFallback(userPrompt) }, finish_reason: 'stop' }],
     })}\n\n`);
-  } else if (mode === null) {
-    for (const event of pending) res.write(`data: ${event}\n\n`);
+  } else {
+    const finishReason = lastChunk?.choices?.[0]?.finish_reason === 'length' ? 'length' : 'stop';
+    writeStreamFinish(res, lastChunk, routedModel, finishReason);
   }
   res.end('data: [DONE]\n\n');
 }
@@ -2210,15 +2191,62 @@ async function readSseResponse(upstream, onEvent) {
     buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
     const blocks = buffer.split(/\r?\n\r?\n/);
     buffer = blocks.pop() || '';
+    if (done && buffer) {
+      blocks.push(buffer);
+      buffer = '';
+    }
     for (const block of blocks) {
       for (const line of block.split(/\r?\n/)) {
         if (!line.startsWith('data:')) continue;
         const data = line.slice(5).trimStart();
-        if (data && data !== '[DONE]') await onEvent(JSON.parse(data), data);
+        if (data && data !== '[DONE]' && await onEvent(JSON.parse(data), data)) {
+          await reader.cancel();
+          return true;
+        }
       }
     }
-    if (done) break;
+    if (done) return false;
   }
+}
+
+function writeVisibleStreamChunk(res, start, chunk) {
+  if (!Array.isArray(chunk?.choices)) return false;
+  const visibleChoices = chunk.choices.map(choice => {
+    const delta = { ...(choice.delta || {}) };
+    delete delta.tool_calls;
+    return { ...choice, delta, finish_reason: null };
+  });
+  if (!visibleChoices.some(choice => Object.keys(choice.delta).length)) return false;
+  start();
+  res.write(`data: ${JSON.stringify({ ...chunk, choices: visibleChoices })}\n\n`);
+  return true;
+}
+
+function hideParsedToolCallText(chunk, priorContentLength, toolCallStart) {
+  if (toolCallStart < 0 || !Array.isArray(chunk?.choices)) return chunk;
+  return {
+    ...chunk,
+    choices: chunk.choices.map((choice, index) => {
+      if (index !== 0 || typeof choice.delta?.content !== 'string') return choice;
+      const visibleLength = Math.max(0, Math.min(
+        choice.delta.content.length,
+        toolCallStart - priorContentLength
+      ));
+      const delta = { ...choice.delta };
+      if (visibleLength) delta.content = delta.content.slice(0, visibleLength);
+      else delete delta.content;
+      return { ...choice, delta };
+    }),
+  };
+}
+
+function writeStreamFinish(res, lastChunk, model, finishReason) {
+  res.write(`data: ${JSON.stringify({
+    id: lastChunk?.id || `chatcmpl-router-${Date.now()}`,
+    object: 'chat.completion.chunk',
+    model,
+    choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
+  })}\n\n`);
 }
 
 async function handleStreamingChat(res, body, routedModel, searched, searchError, searchResults) {
@@ -2284,14 +2312,14 @@ async function handleStreamingChat(res, body, routedModel, searched, searchError
 
     const calls = [];
     const contentParts = [];
-    const pendingEvents = [];
     let mode = null;
-    let holdTextToolCandidate = false;
+    let malformedToolAttempt = false;
     let lastChunk = null;
 
-    const processStreamEvent = async (chunk, rawData) => {
+    const processStreamEvent = async chunk => {
       lastChunk = chunk;
       const delta = chunk?.choices?.[0]?.delta || {};
+      const priorContentLength = contentParts.join('').length;
       if (Array.isArray(delta.tool_calls) && delta.tool_calls.length) {
         mode = 'tools';
         for (const fragment of delta.tool_calls) {
@@ -2302,33 +2330,29 @@ async function handleStreamingChat(res, body, routedModel, searched, searchError
           if (fragment.function?.name) calls[index].function.name += fragment.function.name;
           if (fragment.function?.arguments) calls[index].function.arguments += fragment.function.arguments;
         }
+        if (typeof delta.content === 'string') contentParts.push(delta.content);
+        writeVisibleStreamChunk(res, startResponse, chunk);
         return;
       }
 
       if (typeof delta.content === 'string') contentParts.push(delta.content);
-      if (activeTools && typeof delta.content === 'string'
-          && hasTextToolCallSyntax(contentParts.join(''))) {
-        holdTextToolCandidate = true;
-      }
       const hasText = (typeof delta.content === 'string' && delta.content.length > 0)
         || typeof delta.reasoning_content === 'string';
-      if (mode === null && hasText) {
-        if (!holdTextToolCandidate || typeof delta.reasoning_content === 'string') {
-          mode = 'text';
-        }
+      if (mode === null && hasText) mode = 'text';
+      const parsedText = extractTextToolCalls(contentParts.join(), undefined, true);
+      const textCalls = parsedText.calls;
+      if (textCalls?.length) {
+        calls.push(...textCalls);
+        mode = 'tools';
+        writeVisibleStreamChunk(res, startResponse, hideParsedToolCallText(chunk, priorContentLength, parsedText.start));
+        return true;
       }
-      if (mode === 'text') {
-        startResponse();
-        if (holdTextToolCandidate) {
-          pendingEvents.push(rawData);
-        } else {
-          for (const event of pendingEvents) res.write(`data: ${event}\n\n`);
-          pendingEvents.length = 0;
-          res.write(`data: ${rawData}\n\n`);
-        }
-      } else if (mode === null) {
-        pendingEvents.push(rawData);
+      if (parsedText.start >= 0) {
+        malformedToolAttempt = true;
+        writeVisibleStreamChunk(res, startResponse, hideParsedToolCallText(chunk, priorContentLength, parsedText.start));
+        return true;
       }
+      writeVisibleStreamChunk(res, startResponse, chunk);
     };
 
     if (/^text\/event-stream(?:\s*;|$)/i.test(upstream.headers.get('content-type') || '')) {
@@ -2362,6 +2386,17 @@ async function handleStreamingChat(res, body, routedModel, searched, searchError
     if (!calls.length) {
       const textCalls = extractTextToolCalls(contentParts.join(''));
       if (textCalls) calls.push(...textCalls);
+    }
+
+    if (malformedToolAttempt && !calls.length) {
+      startResponse();
+      res.write(`data: ${JSON.stringify({
+        id: lastChunk?.id || `chatcmpl-${Date.now()}`,
+        object: 'chat.completion.chunk',
+        model: routedModel,
+        choices: [{ index: 0, delta: { content: 'The model produced a malformed tool call, so no action was executed. Please retry the operation.' }, finish_reason: 'stop' }],
+      })}\n\n`);
+      break;
     }
 
     if (calls.length) {
@@ -2427,11 +2462,10 @@ async function handleStreamingChat(res, body, routedModel, searched, searchError
         model: routedModel,
         choices: [{ index: 0, delta: { content: summarizeToolResults(lastToolResults) }, finish_reason: 'stop' }],
       })}\n\n`);
-    } else if (mode === null) {
+    } else {
       startResponse();
-      for (const event of pendingEvents) res.write(`data: ${event}\n\n`);
-    } else if (pendingEvents.length) {
-      for (const event of pendingEvents) res.write(`data: ${event}\n\n`);
+      const finishReason = lastChunk?.choices?.[0]?.finish_reason === 'length' ? 'length' : 'stop';
+      writeStreamFinish(res, lastChunk, routedModel, finishReason);
     }
     break;
   }

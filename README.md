@@ -21,24 +21,27 @@ refactoring, and test-writing tasks to Coder. It sends conversation, explanation
 reasoning, and factual research to General. You can still force `general` or
 `coder` with the request's `model` field.
 
-The llama-ui composer includes a persistent **General preference** slider for
-automatic routing. At 50%, complex/reasoning prompts favor General while code
-tasks and ordinary short prompts favor Coder. Moving the slider toward General
-widens the set of prompts routed there; explicit `general` or `coder` API model
-choices always take priority. The UI starts new chats in `auto` mode.
+The llama-ui composer includes a persistent **General preference** control for
+automatic routing. Click its white button to expand the slider. At 50%,
+complex/reasoning prompts favor General while code tasks and ordinary short
+prompts favor Coder. Moving the slider toward General widens the set of prompts
+routed there; explicit `general` or `coder` API model choices always take
+priority. The UI starts new chats in `auto` mode.
 
 Streaming requests (`"stream": true`) use Server-Sent Events (SSE). Upstream SSE
-tokens are forwarded as they arrive, including short replies and ordinary text
-from llama-ui agent turns. Model reasoning is forwarded separately when the
-upstream exposes it. Structured and recognizable text-form tool calls remain
-buffered until validated so their raw call payload is not shown to the client.
-For llama-ui, the injected UI shim best-effort removes streamed assistant prose
-before a recognized tool card; this depends on the bundled UI's current markup.
-Tool-call turns are executed internally, then the resulting answer continues
-streaming. Short activity lines such as `Reading file…`, `Editing file…`, and
-`Running command…` are streamed while tools execute. If a model server returns
-a regular JSON completion instead, the router converts it to a valid
-single-event SSE response; that fallback cannot provide token-level streaming.
+tokens and upstream reasoning are forwarded as they arrive, including short
+replies and llama-ui agent turns. Text-form tool output is streamed provisionally
+while the router analyzes it; once a complete call is recognized, the router
+stops reading, validates the arguments, and emits the trusted tool card.
+Structured tool-call arguments stay internal until validation and approval
+metadata are ready. For llama-ui, the injected UI shim best-effort removes
+provisional prose before a recognized tool card; this depends on the bundled
+UI's current markup. Tool-call turns are executed internally, then the resulting
+answer continues streaming. Short activity lines such as `Reading file…`,
+`Editing file…`, and `Running command…` are streamed while tools execute. If a
+model server returns a regular JSON completion instead, the router converts it
+to a valid single-event SSE response; that fallback cannot provide token-level
+streaming.
 
 ## VS Code and OpenAI-compatible clients
 
