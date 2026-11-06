@@ -1,0 +1,21 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Start Local AI (balanced)",
+      "type": "shell",
+      "command": "${workspaceFolder}\\Run.bat",
+      "args": ["balanced"],
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true }
+    },
+    {
+      "label": "Start Local AI (deep reasoning)",
+      "type": "shell",
+      "command": "${workspaceFolder}\\Run.bat",
+      "args": ["deep"],
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true }
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+*.gguf
+*.log
+llamafile-*.exe
+/backup/
+/.llmoptimus-trash/
+/.llmoptimus-feature-test/
+/node_modules/
