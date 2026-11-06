@@ -32,6 +32,8 @@ tokens are forwarded as they arrive, including short replies and ordinary text
 from llama-ui agent turns. Model reasoning is forwarded separately when the
 upstream exposes it. Structured and recognizable text-form tool calls remain
 buffered until validated so their raw call payload is not shown to the client.
+For llama-ui, the injected UI shim best-effort removes streamed assistant prose
+before a recognized tool card; this depends on the bundled UI's current markup.
 Tool-call turns are executed internally, then the resulting answer continues
 streaming. Short activity lines such as `Reading file…`, `Editing file…`, and
 `Running command…` are streamed while tools execute. If a model server returns

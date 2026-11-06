@@ -363,7 +363,9 @@ async function main() {
     assert.equal(uiHtmlResponse.headers.get('content-length'), null);
     const uiScriptResponse = await fetch('http://127.0.0.1:18082/router-ui.js');
     assert.match(uiScriptResponse.headers.get('content-type'), /application\/javascript/);
-    assert.match(await uiScriptResponse.text(), /General model routing preference/);
+    const uiScript = await uiScriptResponse.text();
+    assert.match(uiScript, /General model routing preference/);
+    assert.match(uiScript, /llm-optimus-tool-call/);
 
     const nativeToolsResponse = await fetch('http://127.0.0.1:18082/tools');
     const nativeTools = await nativeToolsResponse.json();
