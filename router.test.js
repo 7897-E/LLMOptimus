@@ -33,6 +33,7 @@ async function main() {
   let approvalPhase = false;
   let generalStreamFinished = false;
   let coderStreamFinished = false;
+  let nativeStreamFinished = false;
   let approvalTool = { name: 'read_file', arguments: { filepath: 'README.md' } };
   const generalServer = http.createServer(async (req, res) => {
     if (req.url === '/health') {
@@ -46,7 +47,12 @@ async function main() {
       const body = JSON.parse(Buffer.concat(chunks));
       assert.equal(body.model, 'general');
       assert.equal(body.stream, true);
+      assert.equal(body.general_bias, undefined);
       const userPrompt = body.messages?.at(-1)?.content;
+      if (userPrompt === 'General preference test') {
+        res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+        return res.end(`data: ${JSON.stringify({ id: 'general-preference', choices: [{ index: 0, delta: { content: 'General selected.' }, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`);
+      }
       if (userPrompt === 'Explain why General responses should stream live') {
         generalStreamFinished = false;
         res.writeHead(200, { 'Content-Type': 'text/event-stream' });
@@ -88,6 +94,12 @@ async function main() {
       }));
     }
 
+    if (req.url === '/') {
+      const html = '<!doctype html><html><head></head><body><main>llama-ui</main></body></html>';
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Content-Length': Buffer.byteLength(html) });
+      return res.end(html);
+    }
+
     if (req.url === '/tools') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify([{
@@ -104,6 +116,22 @@ async function main() {
       for await (const chunk of req) chunks.push(chunk);
       const body = JSON.parse(Buffer.concat(chunks));
       const userPrompt = body.messages?.at(-1)?.content;
+      if (userPrompt === 'Native live plain text') {
+        nativeStreamFinished = false;
+        res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+        res.write(`data: ${JSON.stringify({ id: 'native-live', choices: [{ index: 0, delta: { content: 'This answer' }, finish_reason: null }] })}\n\n`);
+        setTimeout(() => {
+          nativeStreamFinished = true;
+          res.end(`data: ${JSON.stringify({ id: 'native-live', choices: [{ index: 0, delta: { content: ' is streaming.' }, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`);
+        }, 250);
+        return;
+      }
+      if (userPrompt === 'hi') {
+        assert.ok(!body.tools.some(tool => (tool.function || tool.definition?.function)?.name === 'get_datetime'));
+        const call = { index: 0, id: 'unrequested-date', type: 'function', function: { name: 'get_datetime', arguments: '{}' } };
+        res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+        return res.end(`data: ${JSON.stringify({ id: 'unrequested-date', choices: [{ index: 0, delta: { tool_calls: [call] }, finish_reason: 'tool_calls' }] })}\n\ndata: [DONE]\n\n`);
+      }
       if (body.model === 'coder' && userPrompt === 'Fenced code streaming') {
         assert.equal(body.stream, true);
         coderStreamFinished = false;
@@ -163,6 +191,11 @@ async function main() {
         res.write(`data: ${JSON.stringify({ id: 'reasoning-stream', choices: [{ index: 0, delta: { reasoning_content: 'First thought. ' }, finish_reason: null }] })}\n\n`);
         setTimeout(() => res.end(`data: ${JSON.stringify({ id: 'reasoning-stream', choices: [{ index: 0, delta: { content: 'Final answer.' }, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`), 100);
         return;
+      }
+      if (userPrompt === 'Low General preference test') {
+        assert.equal(body.model, 'coder');
+        res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+        return res.end(`data: ${JSON.stringify({ id: 'coder-preference', choices: [{ index: 0, delta: { content: 'Coder selected.' }, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`);
       }
       if (body.messages?.at(-1)?.content === 'Structured risky write') {
         const call = { index: 0, id: 'structured-write', type: 'function', function: {
@@ -317,11 +350,20 @@ async function main() {
 
     const propsResponse = await fetch('http://127.0.0.1:18082/props');
     const props = await propsResponse.json();
+    assert.equal(props.model_alias, 'auto');
     assert.equal(props.tools.length, 13);
     assert.equal(props.tools[0].display_name, 'Web search');
     assert.equal(props.tools[0].definition.function.name, 'web_search');
     assert.ok(props.tools.some(tool => tool.tool === 'workspace_inspection'));
     assert.match(propsResponse.headers.get('cache-control'), /no-store/);
+
+    const uiHtmlResponse = await fetch('http://127.0.0.1:18082/');
+    const uiHtml = await uiHtmlResponse.text();
+    assert.match(uiHtml, /<script defer src="\/router-ui\.js"><\/script>/);
+    assert.equal(uiHtmlResponse.headers.get('content-length'), null);
+    const uiScriptResponse = await fetch('http://127.0.0.1:18082/router-ui.js');
+    assert.match(uiScriptResponse.headers.get('content-type'), /application\/javascript/);
+    assert.match(await uiScriptResponse.text(), /General model routing preference/);
 
     const nativeToolsResponse = await fetch('http://127.0.0.1:18082/tools');
     const nativeTools = await nativeToolsResponse.json();
@@ -830,6 +872,56 @@ async function main() {
     assert.ok(!streamedText.includes('"name":"get_project_structure"'));
     assert.ok(stream.includes('data: [DONE]'));
     assert.equal(requests, 2);
+
+    const nativeLiveResponse = await fetch('http://127.0.0.1:18082/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'coder', stream: true, messages: [{ role: 'user', content: 'Native live plain text' }], tools: nativeTools.map(tool => tool.definition) }),
+    });
+    const nativeReader = nativeLiveResponse.body.getReader();
+    const firstNativeChunk = await nativeReader.read();
+    assert.equal(nativeStreamFinished, false, 'llama-ui agent text should stream before upstream completion');
+    let nativeStreamText = new TextDecoder().decode(firstNativeChunk.value);
+    while (true) {
+      const { done, value } = await nativeReader.read();
+      if (done) break;
+      nativeStreamText += new TextDecoder().decode(value);
+    }
+    assert.ok(nativeStreamText.includes('This answer'));
+    assert.ok(nativeStreamText.includes('is streaming.'));
+    assert.ok(nativeStreamText.includes('data: [DONE]'));
+
+    const highBiasResponse = await fetch('http://127.0.0.1:18082/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'auto', general_bias: 70, stream: true, tools: false, messages: [{ role: 'user', content: 'General preference test' }] }),
+    });
+    assert.equal(highBiasResponse.headers.get('x-llm-routed-model'), 'general');
+    assert.ok((await highBiasResponse.text()).includes('General selected.'));
+
+    const lowBiasResponse = await fetch('http://127.0.0.1:18082/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'auto', general_bias: 20, stream: true, tools: false, messages: [{ role: 'user', content: 'Low General preference test' }] }),
+    });
+    assert.equal(lowBiasResponse.headers.get('x-llm-routed-model'), 'coder');
+    assert.ok((await lowBiasResponse.text()).includes('Coder selected.'));
+
+    const invalidBiasResponse = await fetch('http://127.0.0.1:18082/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'auto', general_bias: 101, stream: true, messages: [{ role: 'user', content: 'Invalid preference' }] }),
+    });
+    assert.equal(invalidBiasResponse.status, 400);
+
+    const greetingResponse = await fetch('http://127.0.0.1:18082/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'auto', general_bias: 50, stream: true, tools: nativeTools.map(tool => tool.definition), messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    const greetingStream = await greetingResponse.text();
+    assert.ok(greetingStream.includes('Hi! How can I help?'));
+    assert.ok(!greetingStream.includes('get_datetime'));
 
     const generalLiveResponse = await fetch('http://127.0.0.1:18082/v1/chat/completions', {
       method: 'POST',

@@ -29,6 +29,7 @@ const STATIC_FALLBACK = {
   '/index.html': 'index.html',
   '/bundle.js': 'bundle.js',
   '/bundle.css': 'bundle.css',
+  '/router-ui.js': 'router-ui.js',
 };
 
 const MIME_TYPES = {
@@ -1515,12 +1516,7 @@ function chooseModel(body, prompt) {
   const requested = String(body.model || 'auto').toLowerCase();
   if (requested === 'general' || requested === 'coder') return requested;
   
-  // Check if it's a code-related task
   const isCodeTask = codePatterns.some(pattern => pattern.test(prompt));
-  if (isCodeTask) return 'coder';
-  
-  // Check if the task requires deep thinking/reasoning
-  // Complex questions, analysis, planning, ethical questions, etc.
   const complexityPatterns = [
     /\b(explain.*why|why.* happen|reason|reasoning|analyze|analysis|factor|consider|consideration|implication|pros.*cons|advantage|disadvantage|trade-off|tradeoff)\b/i,
     /\b(plan|strategy|approach|methodology|framework|systematic|step by step|break down|detailed|comprehensive|thorough|in-depth|deep dive)\b/i,
@@ -1529,13 +1525,31 @@ function chooseModel(body, prompt) {
     /\b(design|architecture|system design|software architecture|pattern|best practice|recommend|recommendation|suggest|suggestion)\b/i,
     /\b(how.*work|how.*function|understand|understanding|concept|conceptual|theory|theor|principle|fundament|basis|underlying)\b/i,
   ];
-  
   const needsThinking = complexityPatterns.some(pattern => pattern.test(prompt));
-  if (needsThinking) return 'general';
-  
-  // Simple/casual prompts go to coder for faster response
-  // (coder has no reasoning overhead, responds quickly)
-  return 'coder';
+  const generalScore = isCodeTask ? 10 : needsThinking ? 90 : 40;
+  const generalBias = typeof body.general_bias === 'number' ? body.general_bias : 50;
+  return generalScore >= 100 - generalBias ? 'general' : 'coder';
+}
+
+function isDateTimeRequest(prompt) {
+  return /\b(what (?:day|date|time)|current (?:day|date|time)|today'?s? (?:day|date)|day is (?:it|today)|what day is today)\b/i.test(prompt);
+}
+
+function toolsForPrompt(tools, prompt) {
+  if (!Array.isArray(tools) || isDateTimeRequest(prompt)) return tools;
+  return tools.filter(tool => (tool?.function || tool?.definition?.function)?.name !== 'get_datetime');
+}
+
+function filterCallsToAvailableTools(calls, tools) {
+  const available = new Set((tools || []).map(tool => (tool?.function || tool?.definition?.function)?.name).filter(Boolean));
+  return Array.isArray(calls) ? calls.filter(call => available.has(call?.function?.name)) : null;
+}
+
+function rejectedToolFallback(prompt) {
+  if (/^\s*(?:hi|hello|hey|yo|good morning|good afternoon|good evening)[!. ]*$/i.test(prompt)) {
+    return 'Hi! How can I help?';
+  }
+  return 'I could not use a tool for that request. Please clarify what you would like me to do.';
 }
 
 function shouldSearch(body, prompt) {
@@ -1702,6 +1716,18 @@ async function proxyToCoderWeb(req, res, targetPath) {
     headers.delete('transfer-encoding');
     headers.delete('content-encoding');
     headers.set('cache-control', 'no-cache');
+    if (req.method === 'GET' && /text\/html/i.test(headers.get('content-type') || '')) {
+      let html = await upstream.text();
+      if (!html.includes('/router-ui.js')) {
+        const script = '<script defer src="/router-ui.js"></script>';
+        html = /<\/body\s*>/i.test(html)
+          ? html.replace(/<\/body\s*>/i, `${script}</body>`)
+          : `${html}${script}`;
+      }
+      headers.delete('content-length');
+      res.writeHead(upstream.status, Object.fromEntries(headers.entries()));
+      return res.end(html);
+    }
     res.writeHead(upstream.status, Object.fromEntries(headers.entries()));
     if (upstream.body) Readable.fromWeb(upstream.body).pipe(res);
     else res.end();
@@ -1734,7 +1760,7 @@ function chooseRequiredNativeTool(prompt, tools) {
   if ((prompt.match(/(?:^|\n)\s*\d+[.)]\s/g) || []).length > 1) return undefined;
   // Ignore explicitly prohibited actions when detecting intent.
   const actionable = prompt.replace(/\b(?:do not|don't|never)\b[^\n.!?]*/gi, '');
-  if (/\b(what (?:day|date|time)|current (?:day|date|time)|today'?s? (?:day|date)|day is (?:it|today)|what day is today)\b/i.test(actionable)) return choose('get_datetime');
+  if (isDateTimeRequest(actionable)) return choose('get_datetime');
   if (/\b(workspace inspection|inspect (?:the )?(?:workspace|project)|workspace overview|project overview)\b/i.test(actionable)) return choose('workspace_inspection');
   if (/\b(run|execute|launch|test)\b(?:\s+(?:the\s+)?(?:program|script|file|code|it))?/i.test(actionable)) return choose('run_file');
   if (/\b(delete|remove|trash)\b/i.test(actionable)) return choose('delete_file');
@@ -1831,7 +1857,9 @@ function sendNativeToolCall(res, stream, model, name, args) {
 
 async function proxyNativeToolChat(res, body, routedModel) {
   const targetUrl = routedModel === 'coder' ? CODER_URL : GENERAL_URL;
-  const nativeNames = NATIVE_TOOLS.map(tool => tool.tool);
+  const userPrompt = lastUserText(body.messages);
+  const availableTools = toolsForPrompt(body.tools, userPrompt);
+  const nativeNames = (availableTools || []).map(tool => (tool.function || tool.definition?.function)?.name).filter(Boolean);
   const lastUserIndex = body.messages.reduce((last, message, index) => message?.role === 'user' ? index : last, -1);
   const currentTurnMessages = body.messages.slice(lastUserIndex + 1);
   const toolMessages = currentTurnMessages.filter(message => message?.role === 'tool');
@@ -1840,7 +1868,6 @@ async function proxyNativeToolChat(res, body, routedModel) {
       ? message.tool_calls.map(call => call?.function?.name).filter(Boolean)
       : []
   );
-  const userPrompt = lastUserText(body.messages);
   const failedResult = message => /\b(error|failed|failure|exception|non-zero|exit code|file not found|access denied|no output)\b/i.test(String(message?.content || ''));
   const resultsByCallId = new Map(toolMessages.map(message => [message.tool_call_id, message]));
   const attemptedCalls = currentTurnMessages.flatMap(message =>
@@ -1916,7 +1943,7 @@ async function proxyNativeToolChat(res, body, routedModel) {
       ? { type: 'function', function: { name: recoveryTool } }
     : missingReadNeedsCreate
       ? { type: 'function', function: { name: 'write_file' } }
-      : chooseRequiredNativeTool(userPrompt, body.tools);
+      : chooseRequiredNativeTool(userPrompt, availableTools);
   // Do not force the original operation a second time on the continuation turn.
   const requiredTool = candidateTool && (recoveryTool || !calledNames.includes(candidateTool.function.name))
     ? candidateTool
@@ -1926,8 +1953,8 @@ async function proxyNativeToolChat(res, body, routedModel) {
     tools: forceFinal
       ? undefined
       : requiredTool
-        ? body.tools.filter(tool => (tool.function || tool.definition?.function)?.name === requiredTool.function.name)
-        : body.tools,
+        ? availableTools.filter(tool => (tool.function || tool.definition?.function)?.name === requiredTool.function.name)
+        : availableTools,
     // Llamafile expects tool_choice to be a string. Restricting the schema list
     // to one entry plus "required" reliably forces that exact native tool.
     tool_choice: forceFinal ? undefined : (requiredTool ? 'required' : body.tool_choice),
@@ -2002,6 +2029,8 @@ async function proxyNativeToolChat(res, body, routedModel) {
     const message = payload?.choices?.[0]?.message;
     let calls = forceFinal ? null : validateNativeToolCalls(message?.tool_calls || extractTextToolCalls(message?.content, nativeNames));
     if (!calls && !forceFinal) calls = await repairNativeToolCall(message?.content);
+    const validatedCalls = calls;
+    calls = filterCallsToAvailableTools(calls, availableTools);
     // Native calls may depend on earlier results. Release exactly one action per
     // response so llama-ui returns its result before the model plans the next.
     calls = redirectRepeatedFailedNativeCalls(calls, currentTurnMessages);
@@ -2010,6 +2039,10 @@ async function proxyNativeToolChat(res, body, routedModel) {
       message.content = null;
       message.tool_calls = calls;
       payload.choices[0].finish_reason = 'tool_calls';
+    } else if (validatedCalls?.length) {
+      message.content = rejectedToolFallback(userPrompt);
+      message.tool_calls = undefined;
+      payload.choices[0].finish_reason = 'stop';
     } else if (looksLikeToolAttempt(message?.content)) {
       message.content = 'The model produced a malformed tool call, so no action was executed. Please retry the operation.';
       message.tool_calls = undefined;
@@ -2086,10 +2119,7 @@ async function proxyNativeToolChat(res, body, routedModel) {
     if (typeof delta.content === 'string') contentParts.push(delta.content);
 
     if (mode === null) {
-      const probe = contentParts.join('').trimStart();
-      const looksLikeCall = probe.length < 512 || /^json\b/i.test(probe)
-        || probe.startsWith('{') || probe.startsWith('<') || probe.includes('```');
-      if (!looksLikeCall) mode = 'text';
+      if (!hasTextToolCallSyntax(contentParts.join(''))) mode = 'text';
     }
     if (mode === 'text') {
       start();
@@ -2108,9 +2138,12 @@ async function proxyNativeToolChat(res, body, routedModel) {
     mode === 'structured' ? structuredCalls : extractTextToolCalls(generatedContent, nativeNames)
   );
   if (!calls && !forceFinal && mode !== 'structured') calls = await repairNativeToolCall(generatedContent);
+  const validatedCalls = calls;
   // Do not let a small model queue dependent calls (for example read, then run)
   // before it has observed whether the first action succeeded.
   calls = redirectRepeatedFailedNativeCalls(calls, currentTurnMessages);
+  calls = filterCallsToAvailableTools(calls, availableTools);
+  const rejectedToolCalls = !calls?.length && Boolean(validatedCalls?.length);
   calls = prepareNativeToolCalls(calls?.slice(0, 1));
   const unrepairedToolAttempt = !calls?.length && looksLikeToolAttempt(generatedContent);
   start();
@@ -2139,6 +2172,14 @@ async function proxyNativeToolChat(res, body, routedModel) {
     res.write(`data: ${JSON.stringify({
       id, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: routedModel,
       choices: [{ index: 0, delta: { role: 'assistant', content: 'The model produced a malformed tool call, so no action was executed. Please retry the operation.' }, finish_reason: 'stop' }],
+    })}\n\n`);
+  } else if (rejectedToolCalls) {
+    res.write(`data: ${JSON.stringify({
+      id: lastChunk?.id || `chatcmpl-native-${Date.now()}`,
+      object: 'chat.completion.chunk',
+      created: Math.floor(Date.now() / 1000),
+      model: routedModel,
+      choices: [{ index: 0, delta: { role: 'assistant', content: rejectedToolFallback(userPrompt) }, finish_reason: 'stop' }],
     })}\n\n`);
   } else if (mode === null) {
     for (const event of pending) res.write(`data: ${event}\n\n`);
@@ -2411,6 +2452,11 @@ async function handleStreamingChat(res, body, routedModel, searched, searchError
 async function handleChat(req, res) {
   const body = await readJson(req);
   if (!Array.isArray(body.messages)) return json(res, 400, { error: { message: 'messages must be an array' } });
+  if (body.general_bias !== undefined
+      && (typeof body.general_bias !== 'number' || !Number.isFinite(body.general_bias)
+        || body.general_bias < 0 || body.general_bias > 100)) {
+    return json(res, 400, { error: { message: 'general_bias must be a number from 0 to 100' } });
+  }
 
   const prompt = lastUserText(body.messages);
   const routedModel = chooseModel(body, prompt);
@@ -2438,6 +2484,7 @@ async function handleChat(req, res) {
   }
 
   delete body.web_search;
+  delete body.general_bias;
   body.model = routedModel;
   const clientWantsStream = body.stream === true;
   if (toolsEnabled && body.tools !== false && !hasNativeToolSchemas(body)) {
@@ -2757,6 +2804,10 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { toolsEnabled, approvalsEnabled, workspace: STATIC_DIR });
     }
 
+    if (pathname === '/router-ui.js' && req.method === 'GET') {
+      return serveLocalStaticFile(res, path.join(STATIC_DIR, 'router-ui.js'));
+    }
+
     // For UI requests, try upstream first, fall back to local files
     if (req.method === 'GET' && (pathname === '/' || pathname === '/index.html' || pathname === '/bundle.js' || pathname === '/bundle.css')) {
       // Try upstream first (the exe's web server on 8081)
@@ -2796,7 +2847,7 @@ const server = http.createServer(async (req, res) => {
             // Llama-ui initializes its agent registry from /props. Always inject
             // the router's authoritative schemas instead of the upstream
             // llamafile list, which does not know about router-only tools.
-            return json(res, 200, { ...upstreamProps, tools: NATIVE_TOOLS }, { 'Cache-Control': 'no-store' });
+            return json(res, 200, { ...upstreamProps, model_alias: 'auto', tools: NATIVE_TOOLS }, { 'Cache-Control': 'no-store' });
           }
         } catch { /* Fall through to our own props */ }
       }

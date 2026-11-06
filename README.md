@@ -19,17 +19,24 @@ Double-click `Run.bat`, wait for the `router listening` message, and open:
 Use model `auto` in API requests. The router sends implementation, debugging,
 refactoring, and test-writing tasks to Coder. It sends conversation, explanation,
 reasoning, and factual research to General. You can still force `general` or
-`coder` with the request's `model` field or the web app selector.
+`coder` with the request's `model` field.
+
+The llama-ui composer includes a persistent **General preference** slider for
+automatic routing. At 50%, complex/reasoning prompts favor General while code
+tasks and ordinary short prompts favor Coder. Moving the slider toward General
+widens the set of prompts routed there; explicit `general` or `coder` API model
+choices always take priority. The UI starts new chats in `auto` mode.
 
 Streaming requests (`"stream": true`) use Server-Sent Events (SSE). Upstream SSE
-tokens are forwarded as they arrive, including short replies. If a model server
-returns a regular JSON completion instead, the router converts it to a valid
-single-event SSE response; that fallback cannot provide token-level streaming
-because the upstream response was not streamed. Text-form tool calls remain
+tokens are forwarded as they arrive, including short replies and ordinary text
+from llama-ui agent turns. Model reasoning is forwarded separately when the
+upstream exposes it. Structured and recognizable text-form tool calls remain
 buffered until validated so their raw call payload is not shown to the client.
 Tool-call turns are executed internally, then the resulting answer continues
 streaming. Short activity lines such as `Reading file…`, `Editing file…`, and
-`Running command…` are streamed while tools execute.
+`Running command…` are streamed while tools execute. If a model server returns
+a regular JSON completion instead, the router converts it to a valid
+single-event SSE response; that fallback cannot provide token-level streaming.
 
 ## VS Code and OpenAI-compatible clients
 
