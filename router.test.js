@@ -119,6 +119,30 @@ async function main() {
       for await (const chunk of req) chunks.push(chunk);
       const body = JSON.parse(Buffer.concat(chunks));
       const userPrompt = body.messages?.at(-1)?.content;
+      if (userPrompt === 'Code me a script for python that says hello world') {
+        assert.ok(!body.tools?.length, 'simple code generation should not receive tool schemas');
+        if (!body.stream) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ choices: [{ message: { role: 'assistant', content: 'print(\"Hello, world!\")' }, finish_reason: 'stop' }] }));
+        }
+        res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+        return res.end(`data: ${JSON.stringify({ id: 'hello-world-code', choices: [{ index: 0, delta: { content: 'print(\"Hello, world!\")' }, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`);
+      }
+      if (userPrompt === 'Unexpected tool attempt') {
+        assert.ok(!body.tools?.length, 'the router must not enable tools for a simple prompt');
+        const call = { id: 'unexpected-write', type: 'function', function: { name: 'write_file', arguments: '{\"path\":\".router-unexpected-tool.txt\",\"content\":\"should not be written\"}' } };
+        if (!body.stream) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ choices: [{ message: { role: 'assistant', content: null, tool_calls: [call] }, finish_reason: 'tool_calls' }] }));
+        }
+        res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+        return res.end(`data: ${JSON.stringify({ id: 'unexpected-write', choices: [{ index: 0, delta: { tool_calls: [{ ...call, index: 0 }] }, finish_reason: 'tool_calls' }] })}\n\ndata: [DONE]\n\n`);
+      }
+      if (userPrompt === 'Malformed streaming event') {
+        res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+        res.write(`data: ${JSON.stringify({ id: 'partial-stream', choices: [{ index: 0, delta: { content: 'Partial response.' }, finish_reason: null }] })}\n\n`);
+        return res.end('data: {malformed-json}\n\n');
+      }
       if (userPrompt === 'Native live reasoning') {
         nativeReasoningFinished = false;
         res.writeHead(200, { 'Content-Type': 'text/event-stream' });
@@ -129,7 +153,7 @@ async function main() {
         }, 250);
         return;
       }
-      if (userPrompt === 'Native streaming tool text') {
+      if (userPrompt === 'Tell me about the result of a project file search') {
         nativeToolTextFinished = false;
         res.writeHead(200, { 'Content-Type': 'text/event-stream' });
         res.write(`data: ${JSON.stringify({ id: 'native-tool-live', choices: [{ index: 0, delta: { content: 'json\\n\\n{"name":"file_glob_search","arguments":{"path":' }, finish_reason: null }] })}\n\n`);
@@ -155,7 +179,7 @@ async function main() {
         return;
       }
       if (userPrompt === 'hi') {
-        assert.ok(!body.tools.some(tool => (tool.function || tool.definition?.function)?.name === 'get_datetime'));
+        assert.ok(!body.tools?.some(tool => (tool.function || tool.definition?.function)?.name === 'get_datetime'));
         const call = { index: 0, id: 'unrequested-date', type: 'function', function: { name: 'get_datetime', arguments: '{}' } };
         res.writeHead(200, { 'Content-Type': 'text/event-stream' });
         return res.end(`data: ${JSON.stringify({ id: 'unrequested-date', choices: [{ index: 0, delta: { tool_calls: [call] }, finish_reason: 'tool_calls' }] })}\n\ndata: [DONE]\n\n`);
@@ -174,7 +198,16 @@ async function main() {
       if (body.messages?.[0]?.content?.startsWith('You are a tool-call repair engine.')) {
         assert.match(body.messages?.[1]?.content || '', /CORRECTED_TOOL_CALL=/);
         assert.equal(body.tool_choice, 'required');
-        assert.deepEqual(body.tools.map(tool => tool.function.name), ['read_file']);
+        const repairTool = body.tools[0]?.function?.name;
+        assert.ok(['file_glob_search', 'read_file'].includes(repairTool));
+        if (repairTool === 'file_glob_search') {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({
+            choices: [{ message: { role: 'assistant', content: null, tool_calls: [{
+              id: 'repaired-search', type: 'function', function: { name: repairTool, arguments: '{"path":".","include":"**"}' },
+            }] } }],
+          }));
+        }
         repairRequests++;
         res.writeHead(200, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({
@@ -198,13 +231,13 @@ async function main() {
         res.end(`data: ${JSON.stringify({ id: 'date-tool', choices: [{ index: 0, delta: { content: '{"name":"get_datetime","arguments":{}}' }, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`);
         return;
       }
-      if (body.messages?.at(-1)?.content === 'Mixed tool response') {
+      if (body.messages?.at(-1)?.content === 'Show me what is in example.py') {
         const mixed = '{"name":"read_file","arguments":{"path":"example.py","append_loc":true}}\n\njson\n{"lines":["fabricated"]}\n</tool_response>';
         res.writeHead(200, { 'Content-Type': 'text/event-stream' });
         res.end(`data: ${JSON.stringify({ id: 'mixed-tool', choices: [{ index: 0, delta: { content: mixed }, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`);
         return;
       }
-      if (body.messages?.at(-1)?.content === 'Repair broken call') {
+      if (body.messages?.at(-1)?.content === 'Show me what is in broken.py') {
         res.writeHead(200, { 'Content-Type': 'text/event-stream' });
         res.end(`data: ${JSON.stringify({ id: 'broken-tool', choices: [{ index: 0, delta: { content: '{"name":"read_file","arguments":{"path":"example.py"' }, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`);
         return;
@@ -233,7 +266,7 @@ async function main() {
         res.end(`data: ${JSON.stringify({ id: 'structured-risk', choices: [{ index: 0, delta: { tool_calls: [call] }, finish_reason: null }] })}\n\ndata: ${JSON.stringify({ id: 'structured-risk', choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] })}\n\ndata: [DONE]\n\n`);
         return;
       }
-      if (body.messages?.at(-1)?.content === 'Multiple native calls') {
+      if (body.messages?.at(-1)?.content === 'Show me what is in missing.py') {
         const calls = [
           { index: 0, id: 'multi-read', type: 'function', function: { name: 'read_file', arguments: '{"path":"missing.py"}' } },
           { index: 1, id: 'multi-run', type: 'function', function: { name: 'run_file', arguments: '{"path":"missing.py"}' } },
@@ -241,6 +274,10 @@ async function main() {
         res.writeHead(200, { 'Content-Type': 'text/event-stream' });
         res.end(`data: ${JSON.stringify({ id: 'multi-tools', choices: [{ index: 0, delta: { tool_calls: calls }, finish_reason: null }] })}\n\ndata: ${JSON.stringify({ id: 'multi-tools', choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] })}\n\ndata: [DONE]\n\n`);
         return;
+      }
+      if (body.messages?.at(-1)?.content === 'Generate me a prompt that tells an AI to create, edit, and delete a temporary file.') {
+        res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+        return res.end(`data: ${JSON.stringify({ id: 'prompt-about-tools', choices: [{ index: 0, delta: { content: 'Here is a prompt about temporary-file operations.' }, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`);
       }
       if (body.messages?.some(message => message.role === 'user' && message.content === 'Read missing file accurately')) {
         const call = { index: 0, id: 'repeat-missing-read', type: 'function', function: {
@@ -270,7 +307,7 @@ async function main() {
         res.end(`data: ${JSON.stringify({ id: 'recover-missing', choices: [{ index: 0, delta: { tool_calls: [call] }, finish_reason: null }] })}\n\ndata: ${JSON.stringify({ id: 'recover-missing', choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] })}\n\ndata: [DONE]\n\n`);
         return;
       }
-      if (body.messages?.at(-1)?.content === 'External read') {
+      if (body.messages?.at(-1)?.content === 'Show me what is in C:\\Users\\Public\\external-risk-test.txt') {
         const call = { index: 0, id: 'external-read', type: 'function', function: {
           name: 'read_file', arguments: '{"path":"C:\\\\Users\\\\Public\\\\external-risk-test.txt"}',
         } };
@@ -278,7 +315,7 @@ async function main() {
         res.end(`data: ${JSON.stringify({ id: 'external-risk', choices: [{ index: 0, delta: { tool_calls: [call] }, finish_reason: null }] })}\n\ndata: ${JSON.stringify({ id: 'external-risk', choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] })}\n\ndata: [DONE]\n\n`);
         return;
       }
-      if (body.messages?.at(-1)?.content === 'Sensitive read') {
+      if (body.messages?.at(-1)?.content === 'Show me what is in .env') {
         const call = { index: 0, id: 'sensitive-read', type: 'function', function: {
           name: 'read_file', arguments: '{"path":".env"}',
         } };
@@ -301,6 +338,14 @@ async function main() {
         res.end(`data: ${JSON.stringify({ id: 'multiline-tool', choices: [{ index: 0, delta: { content: `json\n\n${call}` }, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`);
         return;
       }
+      if (!approvalPhase && body.messages?.some(message => message.role === 'user' && message.content === 'Read README.md')) {
+        res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+        if (body.messages.some(message => message.role === 'tool')) {
+          return res.end(`data: ${JSON.stringify({ id: 'readme-final', choices: [{ index: 0, delta: { content: 'Contents of README.md: # LLM Optimus' }, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`);
+        }
+        const call = { index: 0, id: 'readme-tool', type: 'function', function: { name: 'read_file', arguments: '{"path":"README.md"}' } };
+        return res.end(`data: ${JSON.stringify({ id: 'readme-read', choices: [{ index: 0, delta: { tool_calls: [call] }, finish_reason: 'tool_calls' }] })}\n\ndata: [DONE]\n\n`);
+      }
       if (body.tools?.some(tool => tool.function?.name === 'file_glob_search')) {
         res.writeHead(200, { 'Content-Type': 'text/event-stream' });
         res.end(`data: ${JSON.stringify({ id: 'native-stream', choices: [{ index: 0, delta: { content: 'json\\n\\n{"name":"file_glob_search","arguments":{"path":".","include":"**"}}' }, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`);
@@ -319,8 +364,8 @@ async function main() {
       }
       assert.equal(body.stream, true);
       if (requests < 3) {
-        assert.equal(body.tools[0].type, 'function');
-        assert.equal(body.tools[0].function.name, 'web_search');
+        assert.ok(body.tools.some(tool => tool.function.name === 'get_project_structure'));
+        assert.ok(!body.tools.some(tool => tool.function.name === 'web_search'));
       }
 
       if (requests >= 2) {
@@ -367,7 +412,6 @@ async function main() {
       LLM_REQUIRE_APPROVALS: 'false',
     },
   });
-
   try {
     await waitForRouter();
 
@@ -379,6 +423,64 @@ async function main() {
 
     const models = await fetch('http://127.0.0.1:18082/v1/models').then(response => response.json());
     assert.deepEqual(models.data.map(model => model.id), ['auto', 'general', 'coder']);
+
+    const helloWorldResponse = await fetch('http://127.0.0.1:18082/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'coder', stream: true,
+        messages: [{ role: 'user', content: 'Code me a script for python that says hello world' }],
+      }),
+    });
+    const helloWorldStream = await helloWorldResponse.text();
+    assert.ok(helloWorldStream.includes('Hello, world!'));
+    assert.ok(helloWorldStream.includes('data: [DONE]'));
+
+    const helloWorldJson = await fetch('http://127.0.0.1:18082/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'coder', stream: false,
+        messages: [{ role: 'user', content: 'Code me a script for python that says hello world' }],
+      }),
+    }).then(response => response.json());
+    assert.ok(helloWorldJson.choices[0].message.content.includes('Hello, world!'));
+
+    fs.rmSync('.router-unexpected-tool.txt', { force: true });
+    const unexpectedToolResponse = await fetch('http://127.0.0.1:18082/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'coder', stream: true,
+        messages: [{ role: 'user', content: 'Unexpected tool attempt' }],
+      }),
+    });
+    const unexpectedToolStream = await unexpectedToolResponse.text();
+    assert.ok(unexpectedToolStream.includes('Please clarify what you would like me to do.'));
+    assert.ok(!unexpectedToolStream.includes('write_file'));
+    assert.equal(fs.existsSync('.router-unexpected-tool.txt'), false);
+
+    const unexpectedToolJson = await fetch('http://127.0.0.1:18082/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'coder', stream: false,
+        messages: [{ role: 'user', content: 'Unexpected tool attempt' }],
+      }),
+    }).then(response => response.json());
+    assert.equal(unexpectedToolJson.choices[0].message.content, 'I could not use a tool for that request. Please clarify what you would like me to do.');
+    assert.equal(fs.existsSync('.router-unexpected-tool.txt'), false);
+
+    const malformedStreamResponse = await fetch('http://127.0.0.1:18082/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'coder', stream: true, messages: [{ role: 'user', content: 'Malformed streaming event' }] }),
+    });
+    const malformedStream = await malformedStreamResponse.text();
+    assert.ok(malformedStream.includes('Partial response.'));
+    assert.ok(malformedStream.includes('\"error\"'));
+    assert.ok(malformedStream.includes('data: [DONE]'));
+    assert.equal((await fetch('http://127.0.0.1:18082/health')).status, 200);
 
     const propsResponse = await fetch('http://127.0.0.1:18082/props');
     const props = await propsResponse.json();
@@ -530,7 +632,7 @@ async function main() {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         model: 'coder', stream: true,
-        messages: [{ role: 'user', content: 'Mixed tool response' }],
+        messages: [{ role: 'user', content: 'Show me what is in example.py' }],
         tools: nativeTools.map(tool => tool.definition),
       }),
     }).then(response => response.text());
@@ -543,7 +645,7 @@ async function main() {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         model: 'coder', stream: true,
-        messages: [{ role: 'user', content: 'Repair broken call' }],
+        messages: [{ role: 'user', content: 'Show me what is in broken.py' }],
         tools: nativeTools.map(tool => tool.definition),
       }),
     }).then(response => response.text());
@@ -597,7 +699,7 @@ async function main() {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         model: 'coder', stream: true,
-        messages: [{ role: 'user', content: 'Multiple native calls' }],
+        messages: [{ role: 'user', content: 'Show me what is in missing.py' }],
         tools: nativeTools.map(tool => tool.definition),
       }),
     }).then(response => response.text());
@@ -683,7 +785,7 @@ async function main() {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         model: 'coder', stream: true,
-        messages: [{ role: 'user', content: 'External read' }],
+        messages: [{ role: 'user', content: 'Show me what is in C:\\Users\\Public\\external-risk-test.txt' }],
         tools: nativeTools.map(tool => tool.definition),
       }),
     }).then(response => response.text());
@@ -710,7 +812,7 @@ async function main() {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         model: 'coder', stream: true,
-        messages: [{ role: 'user', content: 'Sensitive read' }],
+        messages: [{ role: 'user', content: 'Show me what is in .env' }],
         tools: nativeTools.map(tool => tool.definition),
       }),
     }).then(response => response.text());
@@ -967,7 +1069,7 @@ async function main() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         model: 'coder', stream: true,
-        messages: [{ role: 'user', content: 'Native streaming tool text' }],
+        messages: [{ role: 'user', content: 'Tell me about the result of a project file search' }],
         tools: nativeTools.map(tool => tool.definition),
       }),
     });
@@ -1092,7 +1194,10 @@ async function main() {
     });
     const approvalRequest = () => fetch('http://127.0.0.1:18082/v1/chat/completions', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: 'coder', stream: true, messages: [{ role: 'user', content: 'Read README.md' }] }),
+      body: JSON.stringify({
+        model: 'coder', stream: true,
+        messages: [{ role: 'user', content: `${approvalTool.name === 'read_file' ? 'Read' : approvalTool.name === 'delete_file' ? 'Delete' : 'Write'} ${approvalTool.arguments.filepath || 'README.md'}` }],
+      }),
     }).then(response => response.text());
     const automaticRead = await approvalRequest();
     assert.ok(!automaticRead.includes('Approval required'));
@@ -1136,6 +1241,7 @@ async function main() {
     await close(modelServer);
     fs.rmSync('.router-delete-test.txt', { force: true });
     fs.rmSync('.router-approval-test.txt', { force: true });
+    fs.rmSync('.router-unexpected-tool.txt', { force: true });
     fs.rmSync('.router-python-test.py', { force: true });
     fs.rmSync('.router-node-test.js', { force: true });
     if (fs.existsSync('.llmoptimus-trash')) {

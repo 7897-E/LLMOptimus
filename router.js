@@ -1547,9 +1547,81 @@ function isDateTimeRequest(prompt) {
   return /\b(what (?:day|date|time)|current (?:day|date|time)|today'?s? (?:day|date)|day is (?:it|today)|what day is today)\b/i.test(prompt);
 }
 
-function toolsForPrompt(tools, prompt) {
-  if (!Array.isArray(tools) || isDateTimeRequest(prompt)) return tools;
-  return tools.filter(tool => (tool?.function || tool?.definition?.function)?.name !== 'get_datetime');
+function toolsForPrompt(tools, prompt, messages = []) {
+  if (!Array.isArray(tools)) return tools;
+  const toolName = tool => (tool?.function || tool?.definition?.function)?.name;
+  const available = new Set(tools.map(toolName).filter(Boolean));
+  const selected = new Set();
+  const add = (...names) => names.forEach(name => {
+    if (available.has(name)) selected.add(name);
+  });
+
+  if (isDateTimeRequest(prompt)) {
+    add('get_datetime');
+    return tools.filter(tool => selected.has(toolName(tool)));
+  }
+  if (/\b(?:give|generate|write|create|make) me (?:a |an )?(?:prompt|instructions?|request)\b/i.test(prompt)) {
+    return [];
+  }
+
+  const explicitWebIntent = shouldSearch({}, prompt);
+  if (explicitWebIntent) add('web_search');
+
+  const lastUserIndex = messages.reduce((last, message, index) => message?.role === 'user' ? index : last, -1);
+  const hasToolHistory = messages.slice(lastUserIndex + 1).some(message =>
+    message?.role === 'tool' || (message?.role === 'assistant' && Array.isArray(message.tool_calls))
+  );
+  if (hasToolHistory) {
+    const previousTools = messages.slice(lastUserIndex + 1).flatMap(message =>
+      message?.role === 'assistant' && Array.isArray(message.tool_calls)
+        ? message.tool_calls.map(call => call?.function?.name).filter(Boolean)
+        : []
+    );
+    add(...previousTools);
+    if (previousTools.includes('run_file') || previousTools.includes('exec_shell_command')) {
+      add('read_file', 'edit_file', 'write_file', 'run_file', 'exec_shell_command');
+    } else if (previousTools.includes('read_file') || previousTools.includes('file_glob_search')) {
+      add('read_file', 'file_glob_search', 'write_file', 'edit_file');
+    }
+  }
+
+  const hasFilePath = /\b[\w.-]+\.(?:py|pyi|js|jsx|ts|tsx|json|ya?ml|toml|ini|md|txt|html?|css|cs|java|kt|rs|go|c|cpp|h|hpp|ps1|bat|cmd|env)\b/i.test(prompt)
+    || /(?:[A-Za-z]:[\\/]|\\\\|(?:^|[\s"'])\.\.[\\/])/.test(prompt);
+  const sensitivePathIntent = /(?:^|[\s"'\\/])\.env\b|\b(?:secrets?|credentials?|id_rsa|private[._ -]?key)\b/i.test(prompt);
+  const hasWorkspaceIntent = hasFilePath
+    || sensitivePathIntent
+    || /\b(?:workspace|project|codebase|repository|repo|folder|directory|file|files|source code)\b/i.test(prompt);
+  const hasRunIntent = /\b(?:run|execute|launch|test|compile|runnable)\b/i.test(prompt);
+  const hasWriteIntent = /\b(?:create|write|save|edit|modify|update|change|fix|debug|refactor|delete|remove)\b/i.test(prompt);
+  if (!hasWorkspaceIntent && !hasRunIntent && !hasWriteIntent) {
+    return tools.filter(tool => selected.has(toolName(tool)));
+  }
+
+  const required = chooseRequiredNativeTool(prompt, tools);
+  if (required?.function?.name) add(required.function.name);
+
+  if (/\b(?:structure|overview|inspect|list files?|tree)\b/i.test(prompt)
+      && /\b(?:project|workspace|files?|directory|folder|codebase)\b/i.test(prompt)) {
+    add('workspace_inspection', 'get_project_structure', 'file_glob_search', 'list_files');
+  }
+  if (/\b(?:find|locate|search|list files?|file structure)\b/i.test(prompt)) {
+    add('file_glob_search', 'search_files', 'list_files');
+  }
+  if (/\b(?:read|open|show|contents?|explain|walkthrough|walk through|how does)\b/i.test(prompt) && hasWorkspaceIntent) {
+    add('read_file');
+  }
+  if (/\b(?:write|create|save)\b/i.test(prompt) && hasFilePath) add('write_file');
+  if (/\b(?:edit|modify|update|change|fix|debug|refactor)\b/i.test(prompt) && hasWorkspaceIntent) {
+    add('read_file', 'edit_file', 'apply_diff');
+  }
+  if (/\b(?:delete|remove|trash)\b/i.test(prompt) && hasWorkspaceIntent) add('delete_file');
+  if (hasRunIntent) add('run_file', 'file_glob_search', 'list_files');
+  if ((hasFilePath && /(?:[A-Za-z]:[\\/]|\\\\|(?:^|[\s"'])\.\.[\\/])/.test(prompt))
+      || sensitivePathIntent) {
+    add('approved_external_action');
+  }
+
+  return tools.filter(tool => selected.has(toolName(tool)));
 }
 
 function filterCallsToAvailableTools(calls, tools) {
@@ -1772,13 +1844,14 @@ function chooseRequiredNativeTool(prompt, tools) {
   if ((prompt.match(/(?:^|\n)\s*\d+[.)]\s/g) || []).length > 1) return undefined;
   // Ignore explicitly prohibited actions when detecting intent.
   const actionable = prompt.replace(/\b(?:do not|don't|never)\b[^\n.!?]*/gi, '');
-  if (isDateTimeRequest(actionable)) return choose('get_datetime');
-  if (/\b(workspace inspection|inspect (?:the )?(?:workspace|project)|workspace overview|project overview)\b/i.test(actionable)) return choose('workspace_inspection');
-  if (/\b(run|execute|launch|test)\b(?:\s+(?:the\s+)?(?:program|script|file|code|it))?/i.test(actionable)) return choose('run_file');
-  if (/\b(delete|remove|trash)\b/i.test(actionable)) return choose('delete_file');
-  if (/\b(create|write|overwrite|edit|update|make it (?:say|contain)|change it to)\b/i.test(actionable)) return choose('write_file');
-  if (/\b(find|locate|first file|file structure|project structure|list files?)\b/i.test(actionable)) return choose('file_glob_search');
-  if (/\b(read|contents?|what does .*file say|open .*file|walkthrough|walk through|explain how .*\b(?:file|program|script)\b|how does .*\b(?:file|program|script)\b.*work)\b/i.test(actionable)) return choose('read_file');
+  const intentText = actionable.replace(/\b[\w.-]+\.(?:py|pyi|js|jsx|ts|tsx|json|ya?ml|toml|ini|md|txt|html?|css|cs|java|kt|rs|go|c|cpp|h|hpp|ps1|bat|cmd|env)\b/gi, ' ');
+  if (isDateTimeRequest(intentText)) return choose('get_datetime');
+  if (/\b(workspace inspection|inspect (?:the )?(?:workspace|project)|workspace overview|project overview)\b/i.test(intentText)) return choose('workspace_inspection');
+  if (/\b(run|execute|launch|test)\b(?:\s+(?:the\s+)?(?:program|script|file|code|it))?/i.test(intentText)) return choose('run_file');
+  if (/\b(delete|remove|trash)\b/i.test(intentText)) return choose('delete_file');
+  if (/\b(create|write|overwrite|edit|update|make it (?:say|contain)|change it to)\b/i.test(intentText)) return choose('write_file');
+  if (/\b(find|locate|first file|file structure|project structure|list files?)\b/i.test(intentText)) return choose('file_glob_search');
+  if (/\b(read|contents?|what does .*file say|open .*file|walkthrough|walk through|explain how .*\b(?:file|program|script)\b|how does .*\b(?:file|program|script)\b.*work)\b/i.test(intentText)) return choose('read_file');
   return undefined;
 }
 
@@ -1870,7 +1943,7 @@ function sendNativeToolCall(res, stream, model, name, args) {
 async function proxyNativeToolChat(res, body, routedModel) {
   const targetUrl = routedModel === 'coder' ? CODER_URL : GENERAL_URL;
   const userPrompt = lastUserText(body.messages);
-  const availableTools = toolsForPrompt(body.tools, userPrompt);
+  const availableTools = toolsForPrompt(body.tools, userPrompt, body.messages);
   const nativeNames = (availableTools || []).map(tool => (tool.function || tool.definition?.function)?.name).filter(Boolean);
   const lastUserIndex = body.messages.reduce((last, message, index) => message?.role === 'user' ? index : last, -1);
   const currentTurnMessages = body.messages.slice(lastUserIndex + 1);
@@ -1962,7 +2035,7 @@ async function proxyNativeToolChat(res, body, routedModel) {
     : undefined;
   body = {
     ...body,
-    tools: forceFinal
+    tools: forceFinal || !availableTools.length
       ? undefined
       : requiredTool
         ? availableTools.filter(tool => (tool.function || tool.definition?.function)?.name === requiredTool.function.name)
@@ -1974,11 +2047,15 @@ async function proxyNativeToolChat(res, body, routedModel) {
       role: 'system',
       content: forceFinal
         ? 'The exact same tool call was repeated back-to-back. Stop the loop. Explain what repeated, summarize the available results, and state the next useful alternative instead of claiming success.'
-        : `Native tool workspace: ${STATIC_DIR}. Use "." as the base path. Never invent placeholder paths such as C:\\path\\to\\your\\project or a workspace subfolder. If a filename is uncertain, use file_glob_search before read_file. Use file_glob_search with path "." and include "**" to inspect the project. A file search result already identifies filenames; use the returned relative path exactly. Prefer run_file to run or compile-and-run a known code file with an installed toolchain; do not construct a shell command for it. You must use get_datetime for current date, time, or weekday questions. Never claim a file action or execution succeeded unless the corresponding tool returned success. Emit only the tool call, never describe how tools could be used and never invent or append <tool_response> content. Never repeat an identical failed tool call without changing the tool or its arguments. Do not repeat a successful tool operation already present in this turn. If a requested file does not exist and the user asked to create it, call write_file before trying to read it again. If the user requested validation or testing after a change, perform that next; otherwise give the final answer.`,
+        : availableTools.length
+          ? `Native tool workspace: ${STATIC_DIR}. Use "." as the base path. Never invent placeholder paths such as C:\\path\\to\\your\\project or a workspace subfolder. If a filename is uncertain, use file_glob_search before read_file. Use file_glob_search with path "." and include "**" to inspect the project. A file search result already identifies filenames; use the returned relative path exactly. Prefer run_file to run or compile-and-run a known code file with an installed toolchain; do not construct a shell command for it. Never claim a file action or execution succeeded unless the corresponding tool returned success. Emit only the tool call, never describe how tools could be used and never invent or append <tool_response> content. Never repeat an identical failed tool call without changing the tool or its arguments. Do not repeat a successful tool operation already present in this turn. If a requested file does not exist and the user asked to create it, call write_file before trying to read it again. If the user requested validation or testing after a change, perform that next; otherwise give the final answer.`
+          : 'Answer the user directly. No tools are available or needed for this request. Do not claim to have changed or inspected files.',
     }, ...body.messages],
   };
   if (forceFinal) logRouter('NATIVE', `forcing final answer after ${toolMessages.length} tool results`);
   else if (requiredTool) logRouter('NATIVE', `requiring tool ${requiredTool.function.name}`);
+
+  logRouter('NATIVE', `${availableTools.length} relevant tool schema(s) for this request`);
 
   if (requiredTool?.function.name === 'get_datetime') {
     return sendNativeToolCall(res, body.stream, routedModel, 'get_datetime', {});
@@ -2252,7 +2329,11 @@ function writeStreamFinish(res, lastChunk, model, finishReason) {
 async function handleStreamingChat(res, body, routedModel, searched, searchError, searchResults) {
   const targetUrl = routedModel === 'coder' ? CODER_URL : GENERAL_URL;
   const conversation = [...body.messages];
-  let activeTools = toolsEnabled && body.tools !== false ? AVAILABLE_TOOLS : undefined;
+  const prompt = lastUserText(conversation);
+  let activeTools = toolsEnabled && body.tools !== false
+    ? (Array.isArray(body.tools) ? body.tools : toolsForPrompt(AVAILABLE_TOOLS, prompt, conversation))
+    : undefined;
+  if (!activeTools?.length) activeTools = undefined;
   let toolIterations = 0;
   let headersSent = false;
   const completedCalls = new Map();
@@ -2388,6 +2469,20 @@ async function handleStreamingChat(res, body, routedModel, searched, searchError
       if (textCalls) calls.push(...textCalls);
     }
 
+    const filteredCalls = filterCallsToAvailableTools(calls, activeTools) || [];
+    const unavailableToolCall = calls.length > filteredCalls.length;
+    calls.splice(0, calls.length, ...filteredCalls);
+    if (unavailableToolCall) {
+      startResponse();
+      res.write(`data: ${JSON.stringify({
+        id: lastChunk?.id || `chatcmpl-${Date.now()}`,
+        object: 'chat.completion.chunk',
+        model: routedModel,
+        choices: [{ index: 0, delta: { content: rejectedToolFallback(prompt) }, finish_reason: 'stop' }],
+      })}\n\n`);
+      break;
+    }
+
     if (malformedToolAttempt && !calls.length) {
       startResponse();
       res.write(`data: ${JSON.stringify({
@@ -2521,7 +2616,11 @@ async function handleChat(req, res) {
   delete body.general_bias;
   body.model = routedModel;
   const clientWantsStream = body.stream === true;
-  if (toolsEnabled && body.tools !== false && !hasNativeToolSchemas(body)) {
+  const nativeToolRequest = hasNativeToolSchemas(body);
+  if (!nativeToolRequest && toolsEnabled && body.tools !== false) {
+    body.tools = toolsForPrompt(AVAILABLE_TOOLS, prompt, body.messages);
+  }
+  if (Array.isArray(body.tools) && body.tools.length && !nativeToolRequest) {
     body.messages = [{
       role: 'system',
       content: 'Tool rules: use read_file to read a known file, list_files to inspect a directory, search_files to locate files, and run_file to execute a supported code file. Do not use run_command for operations covered by a dedicated tool. After receiving a tool result, answer the user from that result instead of repeating the call.',
@@ -2542,7 +2641,7 @@ async function handleChat(req, res) {
 
   // llama-ui manages its native agent loop and permission prompts. Preserve
   // its schemas and tool-call SSE verbatim; POST /tools executes safely.
-  if (hasNativeToolSchemas(body)) {
+  if (nativeToolRequest) {
     logRouter('NATIVE', `passing ${routedModel} tool-call stream to llama-ui`);
     return proxyNativeToolChat(res, body, routedModel);
   }
@@ -2560,14 +2659,9 @@ async function handleChat(req, res) {
   };
   
   // Only include tools if they're enabled
-  if (toolsEnabled && body.tools !== false) {
-    // Filter to only enabled tools with proper format for the model
-    const toolsForModel = AVAILABLE_TOOLS;
-    
-    if (toolsForModel.length > 0) {
-      requestBody.tools = toolsForModel;
-      requestBody.tool_choice = body.tool_choice || 'auto';
-    }
+  if (Array.isArray(body.tools) && body.tools.length) {
+    requestBody.tools = body.tools;
+    requestBody.tool_choice = body.tool_choice || 'auto';
   }
 
   let upstream;
@@ -2611,12 +2705,24 @@ async function handleChat(req, res) {
   let toolCallCount = 0;
   const maxToolIterations = 5;
   const completedCalls = new Map();
-  let activeTools = AVAILABLE_TOOLS;
+  let activeTools = requestBody.tools;
 
   while (toolCallCount < maxToolIterations) {
     const responseMessage = response?.choices?.[0]?.message;
     const detectedToolCalls = responseMessage?.tool_calls || extractTextToolCalls(responseMessage?.content);
     if (!detectedToolCalls?.length) break;
+    const allowedToolCalls = filterCallsToAvailableTools(detectedToolCalls, activeTools) || [];
+    if (allowedToolCalls.length !== detectedToolCalls.length) {
+      response = {
+        ...response,
+        choices: [{
+          ...response.choices[0],
+          message: { role: 'assistant', content: rejectedToolFallback(prompt) },
+          finish_reason: 'stop',
+        }],
+      };
+      break;
+    }
     if (requiresApproval(detectedToolCalls)) {
       pendingApproval = { calls: detectedToolCalls, createdAt: Date.now() };
       logRouter('APPROVAL', `requested: ${detectedToolCalls.map(call => call.function.name).join(', ')}`);
@@ -2627,7 +2733,7 @@ async function handleChat(req, res) {
       break;
     }
     toolCallCount++;
-    const toolCalls = detectedToolCalls;
+    const toolCalls = allowedToolCalls;
     const callKey = toolCallsKey(toolCalls);
     const previousResults = completedCalls.get(callKey);
     if (previousResults) {
@@ -2922,6 +3028,13 @@ const server = http.createServer(async (req, res) => {
     json(res, 404, { error: { message: 'Not found' } });
   } catch (error) {
     logRouter('ERROR', `${req.method} ${req.url}: ${error.stack || error.message}`);
+    if (res.headersSent) {
+      if (String(res.getHeader('content-type') || '').includes('text/event-stream') && !res.writableEnded) {
+        res.write(`data: ${JSON.stringify({ error: { message: error.message } })}\n\n`);
+        return res.end('data: [DONE]\n\n');
+      }
+      return res.end();
+    }
     json(res, error.statusCode || 500, { error: { message: error.message } });
   }
 });
